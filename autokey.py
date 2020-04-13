@@ -64,10 +64,10 @@ class BodyPix:
              int(img_width * internal_resolution / MODEL_STRIDE) * MODEL_STRIDE + 1])
         (resized_height, resized_width, _) = prepared_img.shape
         segments = np.squeeze(self._predict(prepared_img), 0)
-        mask = tf.dtypes.cast(
-            tf.math.greater(tf.sigmoid(segments), tf.constant(segmentation_threshold)),
-            tf.uint8)
-        return tf.image.resize_with_pad(mask, img_height, img_width)
+        resized_segments = tf.image.resize_with_pad(segments, img_height, img_width)
+        return tf.dtypes.cast(
+            tf.math.greater(tf.sigmoid(resized_segments), tf.constant(segmentation_threshold)),
+            tf.float32)
 
     # XXX add typing hints (returns logits)
     def _predict(self, input):
