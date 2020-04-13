@@ -71,10 +71,23 @@ class BodyPix:
 
     # XXX add typing hints (returns logits)
     def _predict(self, input):
-        # Normalize the pixels [0, 255] to be between [-1, 1].
-        normalized = input / 127.5 - 1.0
-        batch = tf.expand_dims(normalized, 0)
+        batch = tf.expand_dims(self._preprocess(input), 0)
         return self._predict_function(batch)
+
+    def _preprocess(self, input):
+        raise NotImplementedError
+
+
+class MobileNetV1(BodyPix):
+    def _preprocess(self, input):
+        # Normalize the pixels [0, 255] to be between [-1, 1].
+        return input / 127.5 - 1.0
+
+
+class ResNet50(BodyPix):
+    def _preprocess(self, input):
+        # Add image net mean
+        return input + tf.constant([-123.15, -115.90, -103.06])
 
 
 class FrameGrabber:
@@ -125,12 +138,16 @@ class FrameWriter:
 
 
 def main():
-    body_pix = BodyPix.from_path(sys.argv[2])
-    background = tf.image.resize(tf.image.decode_image(tf.io.read_file(sys.argv[1])), (720, 1280))
+    body_pix = MobileNetV1.from_path(sys.argv[1])
+    if sys.argv[4] == 'replace':
+        background = tf.image.resize(tf.image.decode_image(tf.io.read_file(sys.argv[5])), (720, 1280))
+        blur = False
+    else:
+        blur = True
     output_queue = Queue()
     input_queue = Queue()
     import time
-    with FrameGrabber(sys.argv[3]) as frame_grabber, FrameWriter(sys.argv[4]) as frame_writer:
+    with FrameGrabber(sys.argv[2]) as frame_grabber, FrameWriter(sys.argv[3]) as frame_writer:
         Thread(target=frame_writer.run, args=(output_queue, )).start()
         Thread(target=frame_grabber.run, args=(input_queue, )).start()
         while True:
@@ -139,11 +156,13 @@ def main():
                 input_queue.get()
             img = input_queue.get()
             started = time.monotonic()
-            mask = body_pix.segmentize(img, segmentation_threshold=0.5, internal_resolution=0.75)
-            dilated_mask = cv2.dilate(mask.numpy(), np.ones((32, 32), np.uint8) , iterations=1)
-            eroded_mask = cv2.erode(dilated_mask, np.ones((16, 16), np.uint8) , iterations=1)
-            final_mask = tf.reshape(eroded_mask, (img.shape[0], img.shape[1], 1))
+            mask = body_pix.segmentize(img, segmentation_threshold=0.5, internal_resolution=0.5)
+            dilated_mask = cv2.dilate(mask.numpy(), np.ones((16, 16), np.uint8) , iterations=1)
+            blurred_mask = cv2.blur(dilated_mask, (32, 32))
+            final_mask = tf.reshape(blurred_mask, (img.shape[0], img.shape[1], 1))
             inverted_mask = 1 - final_mask
+            if blur:
+                background = cv2.blur(img.numpy(), (64, 64))
             result = background * inverted_mask + tf.dtypes.cast(img, tf.float32) * final_mask
             output_queue.put(result)
             print(time.monotonic() - started)
