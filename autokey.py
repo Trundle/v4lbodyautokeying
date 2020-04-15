@@ -7,6 +7,7 @@ from threading import Thread
 import cv2
 import numpy as np
 import tensorflow as tf
+import tensorflow_io as tfio
 
 
 MODEL_STRIDE = 16
@@ -122,7 +123,7 @@ class FrameWriter:
     def __enter__(self):
         self._ffmpeg = subprocess.Popen(
             ['ffmpeg', '-i', '-', '-pix_fmt', 'yuv420p', '-f', 'v4l2',
-             '-video_size', 'hd720', '-r', '30', self.device],
+             '-video_size', 'hd720', self.device],
             stdin=subprocess.PIPE)
         return self
 
@@ -133,7 +134,7 @@ class FrameWriter:
         while True:
             tensor = queue.get()
             as_uint8 = tf.dtypes.cast(tensor, tf.uint8)
-            self._ffmpeg.stdin.write(tf.image.encode_png(as_uint8, compression=0).numpy())
+            self._ffmpeg.stdin.write(tfio.image.encode_bmp(as_uint8).numpy())
             self._ffmpeg.stdin.flush()
 
 
