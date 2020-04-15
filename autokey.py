@@ -1,6 +1,6 @@
+import argparse
 import struct
 import subprocess
-import sys
 import time
 from threading import Condition, Lock, Thread
 
@@ -92,13 +92,14 @@ class ResNet50(BodyPix):
 
 
 class FrameGrabber:
-    def __init__(self, device):
+    def __init__(self, device, frame_rate):
         self.device = device
+        self.frame_rate = frame_rate
 
     def __enter__(self):
         self._ffmpeg = subprocess.Popen(
             ["ffmpeg", '-f', 'v4l2', '-video_size', 'hd720', '-i', self.device,
-             '-f', 'image2pipe', '-vcodec', 'bmp', '-r', '10', '-'],
+             '-f', 'image2pipe', '-vcodec', 'bmp', '-r', str(self.frame_rate), '-'],
             stdout=subprocess.PIPE)
         return self
 
@@ -185,22 +186,49 @@ def process_one_frame(body_pix, input_tensor, background=None, *,
         background = cv2.blur(input_tensor.numpy(), (64, 64))
     return background * inverted_mask + tf.dtypes.cast(input_tensor, tf.float32) * final_mask
 
+def _create_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('model')
+    parser.add_argument('-i', '--input-device', default='/dev/video0')
+    parser.add_argument('-o', '--output-device', required=True)
+    parser.add_argument('-r', '--frame-rate', default=10, type=int, help='Input frame rate')
+    parser.add_argument('-t', '--threshold', default=60, type=int, choices=range(0, 100))
+    parser.add_argument(
+        '-ir', '--internal-resolution', default=50, type=int, choices=range(1, 100),
+        help='The internal resolution percentage that the input is resized to '
+             'before inference. The larger the resolution the more accurate '
+             'the model at the cost of slower prediction times.')
+    parser.add_argument(
+        '-bg', '--background',
+        help='Image which will be put as background. If none is given, the '
+             'background will be blurred.')
+    return parser
+
 
 def main():
-    body_pix = MobileNetV1.from_path(sys.argv[1])
-    if sys.argv[4] == 'replace':
-        background = tf.image.resize(tf.image.decode_image(tf.io.read_file(sys.argv[5])), (720, 1280))
+    args = _create_argument_parser().parse_args()
+    body_pix = MobileNetV1.from_path(args.model)
+    if args.background:
+        background = tf.image.resize(
+            tf.image.decode_image(tf.io.read_file(args.background)),
+            (720, 1280))
     else:
         background = None
+    internal_resolution = args.internal_resolution / 100
+    segmentation_threshold = args.threshold / 100
     output_ref = MRef()
     input_ref = MRef()
-    with FrameGrabber(sys.argv[2]) as frame_grabber, FrameWriter(sys.argv[3]) as frame_writer:
+    with FrameGrabber(args.input_device, args.frame_rate) as frame_grabber, \
+            FrameWriter(args.output_device) as frame_writer:
         Thread(target=frame_writer.run, args=(output_ref, )).start()
         Thread(target=frame_grabber.run, args=(input_ref, )).start()
         while True:
             img = input_ref.get()
             started = time.monotonic()
-            result = process_one_frame(body_pix, img, background)
+            result = process_one_frame(
+                body_pix, img, background,
+                segmentation_threshold=segmentation_threshold,
+                internal_resolution=internal_resolution)
             output_ref.set(result)
             print(time.monotonic() - started)
 
