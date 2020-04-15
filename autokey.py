@@ -1,8 +1,8 @@
 import struct
 import subprocess
 import sys
-from queue import Queue
-from threading import Thread
+import time
+from threading import Condition, Lock, Thread
 
 import cv2
 import numpy as np
@@ -105,7 +105,7 @@ class FrameGrabber:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._ffmpeg.kill()
 
-    def run(self, queue):
+    def run(self, ref):
         size_struct = struct.Struct('<I')
         while True:
             header = self._ffmpeg.stdout.read(6)
@@ -113,7 +113,7 @@ class FrameGrabber:
                 raise RuntimeError("Expected Bitmap header not found")
             (size, ) = size_struct.unpack_from(header, 2)
             bmp = tf.image.decode_bmp(header + self._ffmpeg.stdout.read(size - 6))
-            queue.put(bmp)
+            ref.set(bmp)
 
 
 class FrameWriter:
@@ -130,42 +130,78 @@ class FrameWriter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._ffmpeg.kill()
 
-    def run(self, queue):
+    def run(self, ref):
         while True:
-            tensor = queue.get()
+            tensor = ref.get()
             as_uint8 = tf.dtypes.cast(tensor, tf.uint8)
             self._ffmpeg.stdin.write(tfio.image.encode_bmp(as_uint8).numpy())
             self._ffmpeg.stdin.flush()
+
+
+class MRef:
+    """
+    A thread-safe mutable reference. It has two operations: put and set.
+    Put sets a new value, overwriting the last one. Get destructively
+    retrieves the value and blocks if none is set yet.
+    """
+    _sentinel = object()
+
+    def __init__(self, value=_sentinel):
+        self._cond = Condition(Lock())
+        self._value = value
+
+    def get(self):
+        """
+        Retrieves the value, blocking if its not set yet. This operation is destructive.
+        """
+        with self._cond:
+            value = self._value
+            if value is self._sentinel:
+                self._cond.wait()
+                value = self._value
+            self._value = self._sentinel
+            return value
+
+    def set(self, value):
+        """
+        Sets a new value, overwriting the last one.
+        """
+        with self._cond:
+            self._value = value
+            self._cond.notify_all()
+
+
+def process_one_frame(body_pix, input_tensor, background=None, *,
+                      segmentation_threshold=0.6, internal_resolution=0.5):
+    mask = body_pix.segmentize(
+        input_tensor,
+        segmentation_threshold=segmentation_threshold,
+        internal_resolution=internal_resolution)
+    dilated_mask = cv2.dilate(mask.numpy(), (8, 8), iterations=1)
+    blurred_mask = cv2.blur(dilated_mask, (8, 8))
+    final_mask = tf.reshape(blurred_mask, (input_tensor.shape[0], input_tensor.shape[1], 1))
+    inverted_mask = 1 - final_mask
+    if background is None:
+        background = cv2.blur(input_tensor.numpy(), (64, 64))
+    return background * inverted_mask + tf.dtypes.cast(input_tensor, tf.float32) * final_mask
 
 
 def main():
     body_pix = MobileNetV1.from_path(sys.argv[1])
     if sys.argv[4] == 'replace':
         background = tf.image.resize(tf.image.decode_image(tf.io.read_file(sys.argv[5])), (720, 1280))
-        blur = False
     else:
-        blur = True
-    output_queue = Queue()
-    input_queue = Queue()
-    import time
+        background = None
+    output_ref = MRef()
+    input_ref = MRef()
     with FrameGrabber(sys.argv[2]) as frame_grabber, FrameWriter(sys.argv[3]) as frame_writer:
-        Thread(target=frame_writer.run, args=(output_queue, )).start()
-        Thread(target=frame_grabber.run, args=(input_queue, )).start()
+        Thread(target=frame_writer.run, args=(output_ref, )).start()
+        Thread(target=frame_grabber.run, args=(input_ref, )).start()
         while True:
-            while input_queue.qsize() > 2:
-                # Drop frames
-                input_queue.get()
-            img = input_queue.get()
+            img = input_ref.get()
             started = time.monotonic()
-            mask = body_pix.segmentize(img, segmentation_threshold=0.5, internal_resolution=0.5)
-            dilated_mask = cv2.dilate(mask.numpy(), np.ones((16, 16), np.uint8) , iterations=1)
-            blurred_mask = cv2.blur(dilated_mask, (32, 32))
-            final_mask = tf.reshape(blurred_mask, (img.shape[0], img.shape[1], 1))
-            inverted_mask = 1 - final_mask
-            if blur:
-                background = cv2.blur(img.numpy(), (64, 64))
-            result = background * inverted_mask + tf.dtypes.cast(img, tf.float32) * final_mask
-            output_queue.put(result)
+            result = process_one_frame(body_pix, img, background)
+            output_ref.set(result)
             print(time.monotonic() - started)
 
 
