@@ -95,6 +95,7 @@ class FrameGrabber:
     def __init__(self, device, frame_rate):
         self.device = device
         self.frame_rate = frame_rate
+        self.running = False
 
     def __enter__(self):
         self._ffmpeg = subprocess.Popen(
@@ -108,7 +109,8 @@ class FrameGrabber:
 
     def run(self, ref):
         size_struct = struct.Struct('<I')
-        while True:
+        self.running = True
+        while self.running:
             header = self._ffmpeg.stdout.read(6)
             if header[0:2] != b"BM":
                 raise RuntimeError("Expected Bitmap header not found")
@@ -116,10 +118,14 @@ class FrameGrabber:
             bmp = tf.image.decode_bmp(header + self._ffmpeg.stdout.read(size - 6))
             ref.set(bmp)
 
+    def stop(self):
+        self.running = False
+
 
 class FrameWriter:
     def __init__(self, device):
         self.device = device
+        self.running = False
 
     def __enter__(self):
         self._ffmpeg = subprocess.Popen(
@@ -129,14 +135,19 @@ class FrameWriter:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self._ffmpeg.stdin.close()
         self._ffmpeg.kill()
 
     def run(self, ref):
-        while True:
+        self.running = True
+        while self.running:
             tensor = ref.get()
             as_uint8 = tf.dtypes.cast(tensor, tf.uint8)
             self._ffmpeg.stdin.write(tfio.image.encode_bmp(as_uint8).numpy())
             self._ffmpeg.stdin.flush()
+
+    def stop(self):
+        self.running = False
 
 
 class MRef:
@@ -222,15 +233,22 @@ def main():
             FrameWriter(args.output_device) as frame_writer:
         Thread(target=frame_writer.run, args=(output_ref, )).start()
         Thread(target=frame_grabber.run, args=(input_ref, )).start()
-        while True:
-            img = input_ref.get()
-            started = time.monotonic()
-            result = process_one_frame(
-                body_pix, img, background,
-                segmentation_threshold=segmentation_threshold,
-                internal_resolution=internal_resolution)
+        try:
+            while True:
+                img = input_ref.get()
+                started = time.monotonic()
+                result = process_one_frame(
+                    body_pix, img, background,
+                    segmentation_threshold=segmentation_threshold,
+                    internal_resolution=internal_resolution)
+                output_ref.set(result)
+                print(time.monotonic() - started)
+        except KeyboardInterrupt:
+            print("Exiting…", flush=True)
+            frame_grabber.stop()
+            frame_writer.stop()
+            # Push a last frame so the writer isn't stuck in a ref.get()
             output_ref.set(result)
-            print(time.monotonic() - started)
 
 
 main()
